@@ -123,13 +123,6 @@ var (
 				return
 			}
 
-			if err != nil {
-				s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-					Content: "Failed to update role: " + err.Error(),
-				})
-				return
-			}
-
 			// Create category
 			category, err := s.GuildChannelCreateComplex(guildID, discordgo.GuildChannelCreateData{
 				Name: projectName,
@@ -180,9 +173,57 @@ var (
 				return
 			}
 
+			// Add the role to onboarding
+			onboarding, err := s.GuildOnboarding(guildID)
+			if err != nil {
+				s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+					Content: fmt.Sprintf("Successfully created project structures, but failed to add role to onboarding: %s", err.Error()),
+				})
+				return
+			}
+
+			// Find the "Projects" prompt in onboarding (assuming it exists)
+			var projectPrompt *discordgo.GuildOnboardingPrompt
+			for i := range *onboarding.Prompts {
+				prompt := &(*onboarding.Prompts)[i]
+				if prompt.Title == os.Getenv("NEWPROJECT_ONBOARDING_PROMPT_TITLE") {
+					projectPrompt = prompt
+					break
+				}
+			}
+
+			if projectPrompt == nil {
+				s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+					Content: "Successfully created project structures, but couldn't find a 'Projects' prompt in onboarding to add the role to.",
+				})
+				return
+			}
+
+			// Create a new option for the project role
+			newOption := &discordgo.GuildOnboardingPromptOption{
+				Title:       projectName,
+				Description: fmt.Sprintf(projectName),
+				RoleIDs:     []string{role.ID},
+			}
+
+			// Add the new option
+			projectPrompt.Options = append(projectPrompt.Options, *newOption)
+
+			// Update onboarding with the new option
+			_, err = s.GuildOnboardingEdit(guildID, &discordgo.GuildOnboarding{
+				Prompts: onboarding.Prompts,
+			})
+
+			if err != nil {
+				s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+					Content: fmt.Sprintf("Successfully created project structures, but failed to update onboarding: %s", err.Error()),
+				})
+				return
+			}
+
 			// Send success message
 			s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-				Content: fmt.Sprintf("Successfully created project **%s** with:\n- Category %s\n- Text channel #main\n- Voice channel Huddle\n- Role @%s",
+				Content: fmt.Sprintf("Successfully created project **%s** with:\n- Category %s\n- Text channel #main\n- Voice channel Huddle\n- Role @%s\n- Added to onboarding under Projects",
 					projectName, projectName, projectName),
 			})
 		},
