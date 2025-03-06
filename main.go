@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
@@ -20,16 +21,13 @@ var (
 var s *discordgo.Session
 
 func init() {
-	// Load .env file first
 	err := godotenv.Load()
 	if err != nil {
 		log.Println("Warning: Error loading .env file:", err)
 	}
 
-	// Parse flags
 	flag.Parse()
 
-	// Override with environment variables if they exist and flags weren't explicitly set
 	if flag.Lookup("guild").Value.String() == "" {
 		if guildID := os.Getenv("GUILD_ID"); guildID != "" {
 			*GuildID = guildID
@@ -42,7 +40,6 @@ func init() {
 		}
 	}
 
-	// Initialize Discord session
 	var err2 error
 	s, err2 = discordgo.New("Bot " + *BotToken)
 	if err2 != nil {
@@ -123,13 +120,6 @@ var (
 				return
 			}
 
-			if err != nil {
-				s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-					Content: "Failed to update role: " + err.Error(),
-				})
-				return
-			}
-
 			// Create category
 			category, err := s.GuildChannelCreateComplex(guildID, discordgo.GuildChannelCreateData{
 				Name: projectName,
@@ -141,7 +131,7 @@ var (
 						Allow: discordgo.PermissionViewChannel,
 					},
 					{
-						ID:   guildID, // @everyone role has same ID as guild
+						ID:   guildID, // good to know: @everyone role has same ID as guild
 						Type: discordgo.PermissionOverwriteTypeRole,
 						Deny: discordgo.PermissionViewChannel,
 					},
@@ -180,11 +170,90 @@ var (
 				return
 			}
 
-			// Send success message
-			s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-				Content: fmt.Sprintf("Successfully created project **%s** with:\n- Category %s\n- Text channel #main\n- Voice channel Huddle\n- Role @%s",
-					projectName, projectName, projectName),
-			})
+			// Add the role to onboarding
+			onboarding, err := s.GuildOnboarding(guildID)
+			if err != nil {
+				s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+					Content: fmt.Sprintf("Successfully created project structures, but failed to get onboarding: %s", err.Error()),
+				})
+				return
+			}
+
+			var updatedPrompts []string
+			var debugInfo []string
+
+			rolePromptTitle := os.Getenv("NEWPROJECT_ONBOARDING_PROMPT_TITLE")
+			visibilityPromptTitle := os.Getenv("NEWPROJECT_ONBOARDING_VISIBILITY_PROMPT_TITLE")
+
+			debugInfo = append(debugInfo, fmt.Sprintf("Looking for prompts: '%s' and '%s'", rolePromptTitle, visibilityPromptTitle))
+			debugInfo = append(debugInfo, fmt.Sprintf("Found %d prompts in onboarding", len(*onboarding.Prompts)))
+
+			// Process all prompts
+			for i := range *onboarding.Prompts {
+				prompt := &(*onboarding.Prompts)[i]
+
+				debugInfo = append(debugInfo, fmt.Sprintf("Checking prompt: '%s'", prompt.Title))
+
+				// Add to role prompt
+				if prompt.Title == rolePromptTitle {
+					debugInfo = append(debugInfo, fmt.Sprintf("Found role prompt: '%s'", prompt.Title))
+
+					newRoleOption := discordgo.GuildOnboardingPromptOption{
+						Title:       projectName,
+						Description: fmt.Sprintf("Join the %s project team", projectName),
+						RoleIDs:     []string{role.ID},
+					}
+					prompt.Options = append(prompt.Options, newRoleOption)
+					updatedPrompts = append(updatedPrompts, rolePromptTitle)
+				}
+
+				// Add to visibility prompt
+				if prompt.Title == visibilityPromptTitle {
+					debugInfo = append(debugInfo, fmt.Sprintf("Found visibility prompt: '%s'", prompt.Title))
+
+					newVisibilityOption := discordgo.GuildOnboardingPromptOption{
+						Title:       projectName,
+						Description: fmt.Sprintf("See %s project channels", projectName),
+						ChannelIDs:  []string{category.ID},
+						RoleIDs:     []string{role.ID},
+					}
+					prompt.Options = append(prompt.Options, newVisibilityOption)
+					updatedPrompts = append(updatedPrompts, visibilityPromptTitle)
+				}
+			}
+
+			// Update onboarding if any prompts were modified
+			if len(updatedPrompts) > 0 {
+				debugInfo = append(debugInfo, fmt.Sprintf("Updating %d prompts: %s", len(updatedPrompts), strings.Join(updatedPrompts, ", ")))
+
+				onboardingUpdate := discordgo.GuildOnboarding{
+					Prompts:           onboarding.Prompts,
+					Enabled:           onboarding.Enabled,
+					DefaultChannelIDs: onboarding.DefaultChannelIDs,
+					Mode:              onboarding.Mode,
+				}
+
+				_, err = s.GuildOnboardingEdit(guildID, &onboardingUpdate)
+
+				if err != nil {
+					s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+						Content: fmt.Sprintf("Successfully created project structures, but failed to update onboarding: %s\n\nDebug info:\n%s",
+							err.Error(), strings.Join(debugInfo, "\n")),
+					})
+					return
+				}
+
+				s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+					Content: fmt.Sprintf("Successfully created project **%s** with:\n- Category %s\n- Text channel #main\n- Voice channel Huddle\n- Role @%s\n- Added to onboarding prompts: %s\n\nDebug info:\n%s",
+						projectName, projectName, projectName, strings.Join(updatedPrompts, ", "), strings.Join(debugInfo, "\n")),
+				})
+			} else {
+				// No prompts were updated
+				s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+					Content: fmt.Sprintf("Successfully created project **%s** with:\n- Category %s\n- Text channel #main\n- Voice channel Huddle\n- Role @%s\nNote: No onboarding prompts were updated.\n\nDebug info:\n%s",
+						projectName, projectName, projectName, strings.Join(debugInfo, "\n")),
+				})
+			}
 		},
 	}
 )
@@ -225,14 +294,6 @@ func main() {
 
 	if *RemoveCommands {
 		log.Println("Removing commands...")
-		// // We need to fetch the commands, since deleting requires the command ID.
-		// // We are doing this from the returned commands on line 375, because using
-		// // this will delete all the commands, which might not be desirable, so we
-		// // are deleting only the commands that we added.
-		// registeredCommands, err := s.ApplicationCommands(s.State.User.ID, *GuildID)
-		// if err != nil {
-		// 	log.Fatalf("Could not fetch registered commands: %v", err)
-		// }
 
 		for _, v := range registeredCommands {
 			err := s.ApplicationCommandDelete(s.State.User.ID, *GuildID, v.ID)
@@ -242,5 +303,5 @@ func main() {
 		}
 	}
 
-	log.Println("Gracefully shutting down.")
+	log.Println("Bajabongo i leszczyny!")
 }
